@@ -1,11 +1,14 @@
 package com.example.calendarplan.ui.assistant
 
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
-import android.content.Context
-import android.util.Log
 import androidx.lifecycle.ViewModel
+import org.json.JSONArray
+import org.json.JSONObject
 import androidx.lifecycle.viewModelScope
 import com.example.calendarplan.BuildConfig
 import com.example.calendarplan.ui.calendar.CalendarTask
@@ -64,10 +67,16 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
             content = text,
             isUser = true
         )
-        _messages.value = _messages.value + userMessage
-        
-        // Generate AI response
-        _isLoading.value = true
+        // Update LiveData on main thread
+        viewModelScope.launch(Dispatchers.Main) {
+            _messages.value = _messages.value + userMessage
+            
+            // Generate AI response
+            _isLoading.value = true
+            
+            // Log the user message and current time for debugging
+            Log.d("CalendarVM", "User message: $text at ${LocalDateTime.now()}")
+        }
         
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -155,15 +164,19 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
                     // Process the calendar action
                     processCalendarAction(aiResponse)
                     
-                    // Add the AI response to the chat with readyToEnterCalendar flag
+                    // Add the AI response to the chat with readyToEnterCalendar flag and raw response
                     val aiMessage = ChatMessage(
                         content = aiResponse.response.ifBlank { "I've processed your request." },
                         isUser = false,
                         readyToEnterCalendar = aiResponse.readyToEnterCalendar,
-                        eventData = aiResponse.eventData
+                        eventData = aiResponse.eventData,
+                        rawAiResponse = responseText
                     )
-                    _messages.value = _messages.value + aiMessage
-                    _isLoading.value = false
+                    // Update LiveData on main thread
+                    withContext(Dispatchers.Main) {
+                        _messages.value = _messages.value + aiMessage
+                        _isLoading.value = false
+                    }
                 } catch (e: Exception) {
                     // Handle API-specific errors
                     withContext(Dispatchers.Main) {
@@ -214,50 +227,56 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
             val jsonPattern = """(?:\`\`\`json)?\s*(\{[\s\S]*?\})\s*(?:\`\`\`)?|\{[\s\S]*\}""".toRegex()
             val jsonMatch = jsonPattern.find(responseText)
             
-            // If no JSON is found, return the raw text
-            val jsonString = jsonMatch?.groupValues?.getOrNull(1) ?: jsonMatch?.value ?: return AIResponse(
-                response = responseText.take(500), // Limit response length for safety
-                action = CalendarAction.NONE,
-                eventData = null,
-                readyToEnterCalendar = false
-            )
+            // Check for delete keywords in the response text for better detection
+            val isDeleteRequest = responseText.lowercase().contains("delete") || 
+                                responseText.lowercase().contains("remove") ||
+                                responseText.lowercase().contains("cancel")
             
-            // Extract response message with fallback to original text
-            val response = extractJsonValue(jsonString, "response") ?: responseText.replace(jsonString, "").trim()
-            
-            // If response is still empty, use a default message
-            val finalResponse = if (response.isBlank()) {
-                "I've processed your request."
-            } else {
-                response
+            // If no JSON found, check if it might be a delete request
+            if (jsonMatch == null) {
+                // If it looks like a delete request but no JSON, try to extract event info
+                if (isDeleteRequest) {
+                    Log.d("CalendarVM", "Detected possible delete request without proper JSON")
+                    // Try to create a simple delete action with minimal event data
+                    return handlePossibleDeleteRequest(responseText)
+                }
+                
+                return AIResponse(
+                    response = responseText.take(500), // Limit response length for safety
+                    action = CalendarAction.NONE,
+                    eventData = null,
+                    readyToEnterCalendar = false
+                )
             }
             
-            // Extract action with better error handling
-            val actionStr = extractJsonValue(jsonString, "action")?.trim()?.uppercase() ?: "NONE"
+            // Extract the JSON string from the match
+            val jsonString = jsonMatch.groupValues.getOrNull(1) ?: jsonMatch.value
+            
+            // Log the raw JSON for debugging
+            Log.d("CalendarVM", "Raw JSON from AI: $jsonString")
+            
+            // Extract response message
+            val response = extractJsonValue(jsonString, "response") ?: "I've processed your request."
+            
+            // Extract action
+            val actionStr = extractJsonValue(jsonString, "action")?.trim()?.uppercase() ?: 
+                           if (isDeleteRequest) "DELETE_EVENT" else "NONE"
+            
             val action = try {
-                // Handle empty action string
-                if (actionStr.isBlank()) {
-                    Log.w("CalendarVM", "Empty action string, defaulting to NONE")
-                    CalendarAction.NONE
-                } else {
-                    CalendarAction.valueOf(actionStr)
-                }
+                CalendarAction.valueOf(actionStr)
             } catch (e: Exception) {
                 Log.w("CalendarVM", "Invalid action: $actionStr, defaulting to NONE")
                 CalendarAction.NONE
             }
             
-            // Log the raw AI response for debugging
-            Log.d("CalendarVM", "Raw AI response: $jsonString")
-            
-            // Only parse event data if the action requires it
+            // Extract event data if present
             val eventData = if (action == CalendarAction.ADD_EVENT || 
                               action == CalendarAction.EDIT_EVENT || 
                               action == CalendarAction.DELETE_EVENT) {
                 try {
                     val eventDataJson = extractJsonObject(jsonString, "eventData")
                     if (eventDataJson != null) {
-                        // Generate a random UUID for new events
+                        // Generate a random UUID for new events if not provided
                         val id = extractJsonValue(eventDataJson, "id")?.takeIf { it.isNotBlank() } 
                             ?: UUID.randomUUID().toString()
                             
@@ -266,33 +285,31 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
                             
                         val description = extractJsonValue(eventDataJson, "description") ?: ""
                         
-                        // Default to current time if parsing fails
-                        val now = LocalDateTime.now()
+                        // Parse dates with standard format
                         val dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+                        val now = LocalDateTime.now()
                         
+                        // Get start time
                         val startTimeStr = extractJsonValue(eventDataJson, "startTime") ?: ""
-                        val startTime = try {
-                            if (startTimeStr.isNotBlank()) {
+                        val startTime = if (startTimeStr.isNotBlank()) {
+                            try {
                                 LocalDateTime.parse(startTimeStr, dateTimeFormatter)
-                            } else {
+                            } catch (e: Exception) {
+                                Log.w("CalendarVM", "Failed to parse start time: $startTimeStr, using current time")
                                 now
                             }
-                        } catch (e: Exception) {
-                            Log.w("CalendarVM", "Error parsing start time: $startTimeStr, using now")
-                            now
-                        }
+                        } else now
                         
+                        // Get end time
                         val endTimeStr = extractJsonValue(eventDataJson, "endTime") ?: ""
-                        val endTime = try {
-                            if (endTimeStr.isNotBlank()) {
+                        val endTime = if (endTimeStr.isNotBlank()) {
+                            try {
                                 LocalDateTime.parse(endTimeStr, dateTimeFormatter)
-                            } else {
+                            } catch (e: Exception) {
+                                Log.w("CalendarVM", "Failed to parse end time: $endTimeStr, using startTime + 1 hour")
                                 startTime.plusHours(1)
                             }
-                        } catch (e: Exception) {
-                            Log.w("CalendarVM", "Error parsing end time: $endTimeStr, using startTime + 1 hour")
-                            startTime.plusHours(1)
-                        }
+                        } else startTime.plusHours(1)
                         
                         val location = extractJsonValue(eventDataJson, "location") ?: ""
                         
@@ -301,10 +318,10 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
                         val priority = try {
                             EventPriority.valueOf(priorityStr)
                         } catch (e: Exception) {
-                            Log.w("CalendarVM", "Invalid priority: $priorityStr, defaulting to MEDIUM")
                             EventPriority.MEDIUM
                         }
                         
+                        // Create the event
                         CalendarEvent(
                             id = id,
                             title = title,
@@ -317,25 +334,21 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
                     } else null
                 } catch (e: Exception) {
                     Log.e("CalendarVM", "Error parsing event data: ${e.message}")
-                    e.printStackTrace()
                     null
                 }
             } else null
             
-            // Determine if the event is ready to be entered in the calendar
-            val readyToEnterCalendar = determineIfEventIsReady(action, eventData, finalResponse)
-            
+            // Always mark as ready to enter calendar if we have event data
             return AIResponse(
-                response = finalResponse,
+                response = response,
                 action = action,
                 eventData = eventData,
-                readyToEnterCalendar = readyToEnterCalendar
+                readyToEnterCalendar = eventData != null
             )
         } catch (e: Exception) {
             Log.e("CalendarVM", "Error in parseAIResponse: ${e.message}")
-            e.printStackTrace()
             return AIResponse(
-                response = responseText.ifEmpty { "I'm sorry, I couldn't process that request properly." },
+                response = "I'm sorry, I couldn't process that request properly.",
                 action = CalendarAction.NONE,
                 eventData = null,
                 readyToEnterCalendar = false
@@ -355,80 +368,47 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
         return match?.groupValues?.get(1)
     }
     
-    /**
-     * Determines if an event is ready to be entered in the calendar based on the AI response
-     * and event data completeness
-     */
-    private fun determineIfEventIsReady(action: CalendarAction, eventData: CalendarEvent?, response: String): Boolean {
-        // If action is not ADD_EVENT or event data is null, it's not ready
-        if (action != CalendarAction.ADD_EVENT || eventData == null) {
-            return false
-        }
-        
-        // Check if the AI is asking for more information
-        val isAskingForInfo = response.contains("what should I call it") || 
-                             response.contains("what would you like to call") ||
-                             response.contains("how long will it last") ||
-                             response.contains("more information") ||
-                             response.contains("what time") ||
-                             response.contains("when is") ||
-                             response.contains("where is")
-        
-        // If AI is asking questions, the event is not ready
-        if (isAskingForInfo) {
-            return false
-        }
-        
-        // Check if event has all required fields with meaningful values
-        val hasValidTitle = eventData.title.isNotBlank() && eventData.title != "Untitled Event" && eventData.title != "Event" && eventData.title != "To be determined"
-        val hasValidTimes = eventData.startTime != null && eventData.endTime != null
-        
-        return hasValidTitle && hasValidTimes
-    }
-    
-    private fun processCalendarAction(response: AIResponse) {
+    private suspend fun processCalendarAction(response: AIResponse) {
         // Create a confirmation message based on the action
         val confirmationMessage = when (response.action) {
             CalendarAction.ADD_EVENT -> {
                 response.eventData?.let { event ->
-                    // Only add the event to the calendar if it's ready
-                    if (response.readyToEnterCalendar) {
-                        // Ensure event has a valid ID and other required fields
-                        val completeEvent = event.copy(
-                            id = event.id.takeIf { !it.isNullOrBlank() } ?: UUID.randomUUID().toString(),
-                            priority = event.priority ?: EventPriority.MEDIUM,
-                            description = event.description ?: "",
-                            location = event.location ?: ""
-                        )
-                        
-                        // Force update the UI
-                        _lastAction.value = null
-                        
+                    // SIMPLIFIED: Always add the event directly without additional validation
+                    // Log the event data from AI response for debugging
+                    Log.d("CalendarVM", "Processing AI event data:")
+                    Log.d("CalendarVM", "  Title: ${event.title}")
+                    Log.d("CalendarVM", "  Start time: ${event.startTime}")
+                    Log.d("CalendarVM", "  End time: ${event.endTime}")
+                    
+                    // Just use the event as-is from the AI
+                    val completeEvent = event.copy(
+                        id = event.id.takeIf { !it.isNullOrBlank() } ?: UUID.randomUUID().toString()
+                    )
+                    
+                    // Switch to main thread for LiveData updates
+                    withContext(Dispatchers.Main) {
                         val currentEvents = _events.value ?: emptyList()
                         _events.value = currentEvents + completeEvent
-                        
-                        // Share events with timeline
-                        shareEventsWithTimeline()
-                        
-                        // Log the event creation for debugging
-                        Log.d("CalendarVM", "Added event: ${completeEvent.title} at ${completeEvent.startTime}")
-                        
-                        // Add a confirmation message if the AI didn't provide a clear one
-                        if (!response.response.contains("added") && !response.response.contains("created")) {
-                            "Event '${event.title}' added to your calendar for ${event.startTime.format(DateTimeFormatter.ofPattern("MMM d 'at' h:mm a"))}"
-                        } else null
-                    } else {
-                        // Event is not ready, just return the AI's response
-                        Log.d("CalendarVM", "Event not ready to be added to calendar: ${event.title}")
-                        null
                     }
+                    
+                    // Share events with timeline
+                    shareEventsWithTimeline()
+                    
+                    // Log the event creation for debugging
+                    Log.d("CalendarVM", "Added event: ${completeEvent.title} at ${completeEvent.startTime}")
+                    
+                    // Return null since the AI response already contains confirmation
+                    null
                 }
             }
             CalendarAction.EDIT_EVENT -> {
                 response.eventData?.let { updatedEvent ->
-                    val currentEvents = _events.value ?: emptyList()
-                    _events.value = currentEvents.map { 
-                        if (it.id == updatedEvent.id) updatedEvent else it 
+                    // Switch to main thread for LiveData updates
+                    withContext(Dispatchers.Main) {
+                        val currentEvents = _events.value ?: emptyList()
+                        _events.value = currentEvents.map { 
+                            if (it.id == updatedEvent.id) updatedEvent else it 
+                        }
                     }
                     
                     // Share events with timeline
@@ -442,8 +422,38 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
             }
             CalendarAction.DELETE_EVENT -> {
                 response.eventData?.let { eventToDelete ->
-                    val currentEvents = _events.value ?: emptyList()
-                    _events.value = currentEvents.filter { it.id != eventToDelete.id }
+                    Log.d("CalendarVM", "Attempting to delete event with ID: ${eventToDelete.id}")
+                    
+                    // Get current events from both sources to ensure we have the latest
+                    val assistantEvents = _events.value ?: emptyList()
+                    
+                    // Load events directly from SharedPreferences to ensure we have all events
+                    val sharedPrefs = context.getSharedPreferences("CalendarEvents", Context.MODE_PRIVATE)
+                    val eventsJsonStr = sharedPrefs.getString("events", "[]")
+                    val timelineEvents = try {
+                        parseEventsFromJson(eventsJsonStr ?: "[]")
+                    } catch (e: Exception) {
+                        Log.e("CalendarVM", "Error parsing events from SharedPreferences: ${e.message}")
+                        emptyList()
+                    }
+                    
+                    // Combine both sources to ensure we don't miss any events
+                    val allEvents = (assistantEvents + timelineEvents).distinctBy { it.id }
+                    
+                    Log.d("CalendarVM", "Found ${allEvents.size} total events before deletion")
+                    
+                    // Filter out the event to delete
+                    val updatedEvents = allEvents.filter { it.id != eventToDelete.id }
+                    
+                    Log.d("CalendarVM", "After filtering, ${updatedEvents.size} events remain")
+                    
+                    // Update both the assistant's events and the shared preferences
+                    withContext(Dispatchers.Main) {
+                        _events.value = updatedEvents
+                    }
+                    
+                    // Save directly to SharedPreferences
+                    saveEventsDirectlyToSharedPreferences(updatedEvents)
                     
                     // Share events with timeline
                     shareEventsWithTimeline()
@@ -508,6 +518,75 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
         )
     }
     // Share events with other components (like TimelineViewModel)
+    /**
+     * Extract a meaningful title from the AI response if the user didn't specify one
+     */
+    private fun extractTitleFromResponse(response: String): String {
+        // Try to extract a title from phrases like "I've added a meeting with John"
+        val addedPattern = """added (?:a|an|the) ([\w\s]+?)(?:\s+to your calendar|\s+for|\s+at|\s+on|\.)""".
+            toRegex(RegexOption.IGNORE_CASE)
+        val scheduledPattern = """scheduled (?:a|an|the) ([\w\s]+?)(?:\s+for|\s+at|\s+on|\.)""".
+            toRegex(RegexOption.IGNORE_CASE)
+        val createdPattern = """created (?:a|an|the) ([\w\s]+?)(?:\s+for|\s+at|\s+on|\.)""".
+            toRegex(RegexOption.IGNORE_CASE)
+        
+        // Try each pattern in order
+        val addedMatch = addedPattern.find(response)
+        if (addedMatch != null) {
+            val title = addedMatch.groupValues[1].trim()
+            if (title.isNotBlank() && title != "event" && title != "appointment") {
+                Log.d("CalendarVM", "Extracted title from 'added' pattern: $title")
+                return title.capitalize()
+            }
+        }
+        
+        val scheduledMatch = scheduledPattern.find(response)
+        if (scheduledMatch != null) {
+            val title = scheduledMatch.groupValues[1].trim()
+            if (title.isNotBlank() && title != "event" && title != "appointment") {
+                Log.d("CalendarVM", "Extracted title from 'scheduled' pattern: $title")
+                return title.capitalize()
+            }
+        }
+        
+        val createdMatch = createdPattern.find(response)
+        if (createdMatch != null) {
+            val title = createdMatch.groupValues[1].trim()
+            if (title.isNotBlank() && title != "event" && title != "appointment") {
+                Log.d("CalendarVM", "Extracted title from 'created' pattern: $title")
+                return title.capitalize()
+            }
+        }
+        
+        // If no match found, return a default title
+        return "Calendar Event"
+    }
+    
+    /**
+     * Add an appropriate emoji to the event title based on its content
+     */
+    private fun addEmojiToTitle(title: String): String {
+        val lowercaseTitle = title.lowercase()
+        
+        return when {
+            lowercaseTitle.contains("meeting") || lowercaseTitle.contains("call") -> "🤝 $title"
+            lowercaseTitle.contains("lunch") || lowercaseTitle.contains("dinner") || 
+            lowercaseTitle.contains("breakfast") || lowercaseTitle.contains("coffee") -> "🍽️ $title"
+            lowercaseTitle.contains("gym") || lowercaseTitle.contains("workout") || 
+            lowercaseTitle.contains("exercise") -> "💪 $title"
+            lowercaseTitle.contains("doctor") || lowercaseTitle.contains("dentist") || 
+            lowercaseTitle.contains("appointment") -> "🩺 $title"
+            lowercaseTitle.contains("birthday") || lowercaseTitle.contains("party") || 
+            lowercaseTitle.contains("celebration") -> "🎉 $title"
+            lowercaseTitle.contains("travel") || lowercaseTitle.contains("flight") || 
+            lowercaseTitle.contains("trip") -> "✈️ $title"
+            lowercaseTitle.contains("deadline") || lowercaseTitle.contains("due") -> "⏰ $title"
+            lowercaseTitle.contains("study") || lowercaseTitle.contains("class") || 
+            lowercaseTitle.contains("lecture") -> "📚 $title"
+            else -> "📅 $title"
+        }
+    }
+    
     private fun shareEventsWithTimeline() {
         // Use a shared preference or other mechanism to share events
         // This is a simple implementation - in a real app, you might use a repository pattern
@@ -524,18 +603,144 @@ class CalendarAssistantViewModel(private val context: Context) : ViewModel() {
         }
         
         val eventsJson = currentEvents.joinToString(",") { event ->
+            // Use ISO-8601 format for consistent date/time handling
             """
-            {"id":"${event.id}","title":"${event.title}","startTime":"${event.startTime}","endTime":"${event.endTime}","priority":"${event.priority}","description":"${event.description ?: ""}","location":"${event.location ?: ""}"}
+            {"id":"${event.id}","title":"${event.title}","startTime":"${event.startTime}","endTime":"${event.endTime}","priority":"${event.priority}","description":"${event.description ?: ""}","location":"${event.location ?: ""}","isCompleted":${event.isCompleted}}
             """.trimIndent()
         }
         
         editor.putString("events", "[$eventsJson]")
-        editor.apply()
+        // Use commit() instead of apply() to ensure immediate write
+        editor.commit()
         
         Log.d("CalendarVM", "Saved ${currentEvents.size} events to SharedPreferences")
         
+        // Notify the TimelineViewModel to reload events
+        notifyTimelineToReload()
+        
         // Log for debugging
         Log.d("CalendarVM", "Shared ${currentEvents.size} events with timeline")
+    }
+    
+    private fun saveEventsDirectlyToSharedPreferences(events: List<CalendarEvent>) {
+        val sharedPrefs = context.getSharedPreferences("CalendarEvents", Context.MODE_PRIVATE)
+        val editor = sharedPrefs.edit()
+        
+        val eventsJson = events.joinToString(",") { event ->
+            """
+            {"id":"${event.id}","title":"${event.title}","startTime":"${event.startTime}","endTime":"${event.endTime}","priority":"${event.priority}","description":"${event.description ?: ""}","location":"${event.location ?: ""}","isCompleted":${event.isCompleted}}
+            """.trimIndent()
+        }
+        
+        editor.putString("events", "[$eventsJson]")
+        // Use commit() for immediate write
+        val success = editor.commit()
+        
+        Log.d("CalendarVM", "Direct save to SharedPreferences ${if (success) "succeeded" else "failed"}")
+    }
+    
+    private fun parseEventsFromJson(jsonStr: String): List<CalendarEvent> {
+        if (jsonStr.isBlank() || jsonStr == "[]") return emptyList()
+        
+        val events = mutableListOf<CalendarEvent>()
+        try {
+            val jsonArray = JSONArray(jsonStr)
+            for (i in 0 until jsonArray.length()) {
+                try {
+                    val eventJson = jsonArray.getJSONObject(i)
+                    val id = eventJson.optString("id")
+                    if (id.isBlank()) continue
+                    
+                    val title = eventJson.optString("title", "Untitled Event")
+                    val startTimeStr = eventJson.optString("startTime")
+                    val endTimeStr = eventJson.optString("endTime")
+                    
+                    // Parse dates with fallback
+                    val startTime = try {
+                        LocalDateTime.parse(startTimeStr)
+                    } catch (e: Exception) {
+                        LocalDateTime.now()
+                    }
+                    
+                    val endTime = try {
+                        LocalDateTime.parse(endTimeStr)
+                    } catch (e: Exception) {
+                        startTime.plusHours(1)
+                    }
+                    
+                    val priorityStr = eventJson.optString("priority", "MEDIUM")
+                    val priority = try {
+                        EventPriority.valueOf(priorityStr)
+                    } catch (e: Exception) {
+                        EventPriority.MEDIUM
+                    }
+                    
+                    events.add(CalendarEvent(
+                        id = id,
+                        title = title,
+                        description = eventJson.optString("description", ""),
+                        startTime = startTime,
+                        endTime = endTime,
+                        location = eventJson.optString("location", ""),
+                        priority = priority,
+                        isCompleted = eventJson.optBoolean("isCompleted", false)
+                    ))
+                } catch (e: Exception) {
+                    Log.e("CalendarVM", "Error parsing event: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CalendarVM", "Error parsing events JSON: ${e.message}")
+        }
+        
+        return events
+    }
+    
+    private fun notifyTimelineToReload() {
+        // Broadcast an intent to notify the TimelineViewModel to reload
+        val intent = Intent("com.example.calendarplan.RELOAD_EVENTS")
+        
+        // Log the broadcast for debugging
+        Log.d("CalendarVM", "Broadcasting reload intent to timeline")
+        
+        try {
+            // Send broadcast with RECEIVER_NOT_EXPORTED flag for Android security requirements
+            context.sendBroadcast(intent, null)
+            
+            // Force a direct reload by accessing the shared preferences
+            // This is a fallback in case the broadcast doesn't work
+            val sharedPrefs = context.getSharedPreferences("CalendarEvents", Context.MODE_PRIVATE)
+            val eventsJson = sharedPrefs.getString("events", "[]")
+            Log.d("CalendarVM", "Current events in SharedPreferences: $eventsJson")
+        } catch (e: Exception) {
+            Log.e("CalendarVM", "Error sending broadcast: ${e.message}")
+        }
+    }
+    
+    private fun handlePossibleDeleteRequest(responseText: String): AIResponse {
+        // Try to find event title or ID in the text
+        val currentEvents = _events.value ?: emptyList()
+        
+        // Look for any event title in the response
+        for (event in currentEvents) {
+            if (responseText.contains(event.title, ignoreCase = true)) {
+                Log.d("CalendarVM", "Found event to delete by title: ${event.title}")
+                return AIResponse(
+                    response = "I'll delete the event '${event.title}' for you.",
+                    action = CalendarAction.DELETE_EVENT,
+                    eventData = event,
+                    readyToEnterCalendar = true
+                )
+            }
+        }
+        
+        // If no specific event found, return a generic response
+        return AIResponse(
+            response = "I couldn't find which event you want to delete. Could you specify the event name?",
+            action = CalendarAction.NONE,
+            eventData = null,
+            readyToEnterCalendar = false
+        )
     }
 }
 
